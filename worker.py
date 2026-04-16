@@ -12,6 +12,7 @@ from datetime import datetime
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
 
 # ── Logging ──
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -22,11 +23,9 @@ API_ID     = int(os.environ["TG_API_ID"])
 API_HASH   = os.environ["TG_API_HASH"]
 SESSION    = os.environ.get("TG_SESSION", "smiles_session")
 BOT_USER   = os.environ.get("SMILES_BOT", "smileshelperbot")
-WORKER_KEY = os.environ.get("WORKER_SECRET", "change-me")  # para evitar abuso
+WORKER_KEY = os.environ.get("WORKER_SECRET", "change-me")
 PORT       = int(os.environ.get("PORT", "8080"))
 
-# Usa StringSession si hay session string, sino archivo local
-from telethon.sessions import StringSession
 SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
 
 if SESSION_STRING:
@@ -34,17 +33,16 @@ if SESSION_STRING:
 else:
     client = TelegramClient(SESSION, API_ID, API_HASH)
 
-# ── Búsqueda con rate limiting ──
-# Un solo lock para todas las búsquedas (evita spam al bot)
+# ── Rate limiting ──
 search_lock = asyncio.Lock()
 LAST_SEARCH_TS = [0.0]
-MIN_INTERVAL   = 30  # segundos entre búsquedas
+MIN_INTERVAL   = 30
 
 
 async def query_smiles_bot(origin: str, dest: str, date: str, days: int = 7) -> str:
     """
-    Manda un mensaje a @smileshelperbot y espera la respuesta.
-    Formato: "EZE NRT 2026-07-15 d7"
+    Manda un mensaje al bot y espera todos los mensajes de respuesta.
+    El bot suele mandar primero "Buscando..." y después el resultado (puede ser 1 o varios).
     """
     async with search_lock:
         # Rate limit
@@ -58,105 +56,125 @@ async def query_smiles_bot(origin: str, dest: str, date: str, days: int = 7) -> 
         command = f"{origin} {dest} {date} d{days}"
         log.info(f"→ Enviando a @{BOT_USER}: {command}")
 
-        # Enviar mensaje
-        sent = await client.send_message(BOT_USER, command)
+        collected = []
+        got_real_message = asyncio.Event()
 
-        # Esperar respuesta (máximo 60s)
-        response_text = None
-
-        async def wait_for_reply():
-            nonlocal response_text
-            future = asyncio.Future()
-
-            @client.on(events.NewMessage(from_users=BOT_USER))
-            async def handler(event):
-                # Ignorar mensajes "Procesando..." típicos
-                msg = event.message.message or ""
-                if len(msg) < 50 and ("procesando" in msg.lower() or "buscando" in msg.lower()):
-                    return
-                if not future.done():
-                    future.set_result(msg)
-
-            try:
-                response_text = await asyncio.wait_for(future, timeout=60)
-            finally:
-                client.remove_event_handler(handler)
+        @client.on(events.NewMessage(from_users=BOT_USER))
+        async def handler(event):
+            msg = event.message.message or ""
+            # Ignorar "Buscando las mejores ofertas..." u otros de estado
+            is_status = len(msg) < 80 and (
+                "buscando" in msg.lower() or
+                "procesando" in msg.lower() or
+                "espera" in msg.lower()
+            )
+            if is_status:
+                log.info(f"  [status] {msg[:60]}")
+                return
+            collected.append(msg)
+            got_real_message.set()
+            log.info(f"  ← mensaje real ({len(msg)} chars)")
 
         try:
-            await wait_for_reply()
-        except asyncio.TimeoutError:
-            log.warning("Timeout esperando respuesta del bot")
-            response_text = None
+            await client.send_message(BOT_USER, command)
 
-        LAST_SEARCH_TS[0] = asyncio.get_event_loop().time()
-        return response_text or ""
+            # Esperar primer mensaje real (máx 60s)
+            try:
+                await asyncio.wait_for(got_real_message.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                log.warning("Timeout esperando primera respuesta")
+                return ""
+
+            # Esperar 3 segundos más por si hay más mensajes
+            await asyncio.sleep(3)
+
+        finally:
+            client.remove_event_handler(handler)
+            LAST_SEARCH_TS[0] = asyncio.get_event_loop().time()
+
+        return "\n\n".join(collected)
 
 
 def parse_smiles_response(text: str) -> list:
     """
-    Parsea la respuesta del bot a una lista estructurada.
-    El formato exacto depende del bot, así que hacemos un parseo genérico:
-    buscamos líneas con millas + precio + fecha + aerolínea.
+    Parsea el formato real de @smileshelperbot:
+
+    ✈️07/10: 107500 + 63K/$163K Avianca,ECO,1 escalas,🕐20hs,💺4👣1
+    ✈️11/10: 111000 + 63K/$163K Avianca,ECO,1 escalas,🕐19hs,💺9👣1
+
+    Devuelve lista estructurada.
     """
     if not text:
         return []
 
     results = []
-    lines = text.split("\n")
 
-    # Heurística: buscar líneas que tengan números de millas + fecha
-    # Formato típico del bot: "✈️ 2026-07-15 | 40.000 millas + USD 120 | Aerolíneas Argentinas"
-    flight_pattern = re.compile(
-        r"(\d{4}-\d{2}-\d{2}).*?([\d.,]+)\s*mill?a?s?(?:.*?(\d+)\s*(?:USD|\$))?",
+    # Regex para cada línea de vuelo
+    # ✈️DD/MM: MILLAS + ARSK/$USDK AEROLÍNEA,CLASE,N escalas,🕐Xhs,...
+    pattern = re.compile(
+        r"✈️?\s*"                           # avión (opcional el emoji)
+        r"(\d{1,2})/(\d{1,2})"              # DD/MM
+        r".*?:\s*"                          # : después de fecha
+        r"([\d.]+)"                         # millas (puede tener puntos)
+        r"\s*\+\s*"                         # +
+        r"(\d+)K"                           # ARS en K
+        r"/\$?([\d.]+K?)"                   # USD o valor alternativo
+        r"\s*"
+        r"([A-Za-zÁ-ú\s]+?)"                # aerolínea
+        r"\s*,\s*"
+        r"([A-Z]+)"                         # clase (ECO, EJE, etc)
+        r"\s*,\s*"
+        r"(\d+)\s*escala",                  # N escalas
         re.IGNORECASE,
     )
 
-    current_block = []
-    for line in lines:
+    # Intentar extraer año del texto (si el bot lo pone en el header "EZE MIA 2026-10-07")
+    year_match = re.search(r"(\d{4})-\d{2}-\d{2}", text)
+    year = int(year_match.group(1)) if year_match else datetime.now().year
+
+    for line in text.split("\n"):
         line = line.strip()
         if not line:
-            if current_block:
-                block_text = " ".join(current_block)
-                match = flight_pattern.search(block_text)
-                if match:
-                    date    = match.group(1)
-                    miles   = int(re.sub(r"[.,]", "", match.group(2)))
-                    usd     = int(match.group(3)) if match.group(3) else 0
-                    results.append({
-                        "date":    date,
-                        "miles":   miles,
-                        "usd":     usd,
-                        "raw":     block_text[:300],
-                    })
-                current_block = []
             continue
-        current_block.append(line)
 
-    # Último bloque
-    if current_block:
-        block_text = " ".join(current_block)
-        match = flight_pattern.search(block_text)
-        if match:
-            date    = match.group(1)
-            miles   = int(re.sub(r"[.,]", "", match.group(2)))
-            usd     = int(match.group(3)) if match.group(3) else 0
-            results.append({
-                "date":  date,
-                "miles": miles,
-                "usd":   usd,
-                "raw":   block_text[:300],
-            })
+        match = pattern.search(line)
+        if not match:
+            continue
 
-    # Si no parseó nada, devolver el texto crudo como un solo "resultado"
-    if not results and text:
-        results.append({"date": None, "miles": 0, "usd": 0, "raw": text[:2000]})
+        day, month, miles_str, ars_k, usd_or_alt, airline, cabin, stops = match.groups()
 
+        # Normalizar millas (pueden venir como "107500" o "107.500")
+        miles = int(miles_str.replace(".", "").replace(",", ""))
+
+        # Convertir ARS_K a número real (63K → 63000)
+        ars = int(ars_k) * 1000
+
+        # Intentar extraer duración
+        duration_match = re.search(r"🕐?\s*(\d+)\s*hs", line)
+        duration_hs = int(duration_match.group(1)) if duration_match else None
+
+        # Formatear fecha YYYY-MM-DD
+        date_str = f"{year}-{int(month):02d}-{int(day):02d}"
+
+        results.append({
+            "date":        date_str,
+            "day_month":   f"{int(day):02d}/{int(month):02d}",
+            "miles":       miles,
+            "ars":         ars,
+            "airline":     airline.strip(),
+            "cabin":       cabin.strip(),
+            "stops":       int(stops),
+            "duration_hs": duration_hs,
+            "raw":         line[:200],
+        })
+
+    # Ordenar por millas (más baratos arriba)
+    results.sort(key=lambda r: r["miles"])
     return results
 
 
 # ── HTTP endpoints ──
 async def handle_search(request: web.Request):
-    # Auth
     key = request.headers.get("X-Worker-Key") or request.query.get("key")
     if key != WORKER_KEY:
         return web.json_response({"error": "Unauthorized"}, status=401)
@@ -201,7 +219,7 @@ async def handle_health(request: web.Request):
 
 async def handle_root(request: web.Request):
     return web.Response(
-        text="Smiles Worker OK. Usar /search?origin=EZE&dest=NRT&date=2026-07-15&days=7&key=SECRET",
+        text="Smiles Worker OK. /search?origin=EZE&dest=NRT&date=2026-07-15&days=7&key=SECRET",
         content_type="text/plain",
     )
 
@@ -223,7 +241,6 @@ async def main():
     await site.start()
     log.info(f"🌐 HTTP server escuchando en puerto {PORT}")
 
-    # Mantener corriendo
     await asyncio.Event().wait()
 
 
