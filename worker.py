@@ -2,7 +2,8 @@
 Smiles Worker — Railway
 - Consulta @smileshelperbot para vuelos con millas
 - Busca combinaciones de tramos (split ticket) via fast-flights
-- Maneja cola de trabajos asíncrona porque las búsquedas combinadas tardan varios minutos
+- Maneja cola de trabajos asíncrona
+- Acepta búsqueda por MES (prueba 2 fechas del mes para no tardar una eternidad)
 """
 
 import os
@@ -17,7 +18,6 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
 
-# fast-flights para Google Flights sin API key
 try:
     from fast_flights import FlightData, Passengers, get_flights
     FAST_FLIGHTS_AVAILABLE = True
@@ -42,27 +42,20 @@ if SESSION_STRING:
 else:
     client = TelegramClient(SESSION, API_ID, API_HASH)
 
-# ── Rate limiting Smiles ──
 smiles_lock = asyncio.Lock()
 LAST_SMILES_TS = [0.0]
 MIN_SMILES_INTERVAL = 30
 
-# ── Hubs de conexión ──
 HUBS = ["SCL", "GRU", "MAD"]
 
-# ── Job storage (en memoria) ──
 JOBS = {}  # job_id → {status, progress, result, started_at}
 
 
-# ═══════════════════════════════════════════════════════════
-# Smiles bot (con extracción de links)
-# ═══════════════════════════════════════════════════════════
-
+# ═══════════ Smiles bot ═══════════
 def extract_entity_links(message) -> list:
     links = []
     text = message.message or ""
-    entities = message.entities or []
-    for ent in entities:
+    for ent in (message.entities or []):
         if isinstance(ent, MessageEntityTextUrl):
             visible = text[ent.offset : ent.offset + ent.length]
             links.append({"text": visible, "url": ent.url})
@@ -166,12 +159,8 @@ def parse_smiles_response(text: str, links: list) -> list:
     return results
 
 
-# ═══════════════════════════════════════════════════════════
-# Google Flights (fast-flights) - wrapped en executor
-# ═══════════════════════════════════════════════════════════
-
+# ═══════════ Google Flights via fast-flights ═══════════
 def _gf_search_sync(origin, dest, date):
-    """Sincrónico, corre en thread executor."""
     if not FAST_FLIGHTS_AVAILABLE:
         return []
     try:
@@ -195,13 +184,12 @@ def _gf_search_sync(origin, dest, date):
                 stops_n = int(sd) if sd else (0 if "nonstop" in stops_v.lower() else 1)
             else:
                 stops_n = int(stops_v) if stops_v else 0
-            duration = getattr(f, "duration", "") or ""
-            dep_time = getattr(f, "departure", "") or ""
-            arr_time = getattr(f, "arrival", "") or ""
             out.append({
                 "origin": origin, "dest": dest, "date": date,
                 "price": price, "airline": airline, "stops": stops_n,
-                "duration": duration, "dep_time": dep_time, "arr_time": arr_time,
+                "duration": getattr(f, "duration", "") or "",
+                "dep_time": getattr(f, "departure", "") or "",
+                "arr_time": getattr(f, "arrival", "") or "",
             })
         return sorted(out, key=lambda x: x["price"])
     except Exception as e:
@@ -214,182 +202,294 @@ async def gf_search(origin, dest, date):
     return await loop.run_in_executor(None, _gf_search_sync, origin, dest, date)
 
 
-# ═══════════════════════════════════════════════════════════
-# Búsqueda combinada (split ticket)
-# ═══════════════════════════════════════════════════════════
-
+# ═══════════ Combos ═══════════
 def parse_time_str(s: str) -> int:
-    """Convierte '10:30 AM' o '14:25' a minutos del día. Devuelve -1 si no puede."""
     s = (s or "").strip().upper()
     m = re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)?", s)
     if not m:
         return -1
-    h = int(m.group(1))
-    mn = int(m.group(2))
-    ap = m.group(3)
-    if ap == "PM" and h != 12:
-        h += 12
-    elif ap == "AM" and h == 12:
-        h = 0
+    h = int(m.group(1)); mn = int(m.group(2)); ap = m.group(3)
+    if ap == "PM" and h != 12: h += 12
+    elif ap == "AM" and h == 12: h = 0
     return h * 60 + mn
 
 
-def estimate_layover_hours(leg1_date: str, leg1_arr: str,
-                             leg2_date: str, leg2_dep: str) -> float:
-    """Estima horas entre llegada del tramo 1 y salida del tramo 2."""
+def estimate_layover_hours(d1: str, arr: str, d2: str, dep: str) -> float:
     try:
-        d1 = datetime.strptime(leg1_date, "%Y-%m-%d")
-        d2 = datetime.strptime(leg2_date, "%Y-%m-%d")
+        dt1 = datetime.strptime(d1, "%Y-%m-%d")
+        dt2 = datetime.strptime(d2, "%Y-%m-%d")
     except ValueError:
         return 0.0
-    arr_min = parse_time_str(leg1_arr)
-    dep_min = parse_time_str(leg2_dep)
-    if arr_min < 0 or dep_min < 0:
-        # No pudimos parsear, asumimos mínimo día completo si fechas distintas
-        return max(24.0 * (d2 - d1).days, 0.0)
-    minutes = ((d2 - d1).days * 24 * 60) + (dep_min - arr_min)
+    am = parse_time_str(arr); dm = parse_time_str(dep)
+    if am < 0 or dm < 0:
+        return max(24.0 * (dt2 - dt1).days, 0.0)
+    minutes = ((dt2 - dt1).days * 24 * 60) + (dm - am)
     return minutes / 60.0
 
 
+def get_sample_dates_for_month(year_month: str, samples=None) -> list:
+    """Devuelve N fechas de muestra del mes (default: días 10 y 20)."""
+    if samples is None:
+        samples = [10, 20]
+    try:
+        year, month = map(int, year_month.split("-"))
+    except ValueError:
+        return []
+    dates = []
+    for day in samples:
+        try:
+            d = datetime(year, month, day)
+            if d > datetime.now() + timedelta(days=2):
+                dates.append(d.strftime("%Y-%m-%d"))
+        except ValueError:
+            pass
+    return dates
+
+
 async def run_combo_search(job_id: str, origin: str, final_dest: str,
-                            outbound_date: str, min_layover_h: int, max_layover_h: int,
+                            year_month: str, min_layover_h: int, max_layover_h: int,
                             include_smiles: bool):
     """
-    Busca tramos EZE→hub + hub→destino para cada hub, combina y filtra
-    por tiempo de layover razonable. Opcionalmente consulta Smiles.
+    year_month: 'YYYY-MM' → prueba días 10 y 20 del mes
+    Para cada fecha, busca: directo + (EZE→hub, hub→dest) × 3 hubs
+    Combina, filtra layover, devuelve top combos.
     """
     job = JOBS[job_id]
     job["status"] = "running"
-    job["progress"] = "Buscando tramos directos..."
 
-    all_combos = []
-    total_steps = 1 + len(HUBS) * 2 + (len(HUBS) + 1 if include_smiles else 0)
-    step = 0
+    sample_dates = get_sample_dates_for_month(year_month)
+    if not sample_dates:
+        job["status"] = "done"
+        job["progress"] = "✅ Sin fechas válidas"
+        job["result"] = {"error": "Sin fechas futuras en ese mes", "combos": []}
+        return
 
-    def bump(msg):
-        nonlocal step
-        step += 1
-        job["progress"] = f"[{step}/{total_steps}] {msg}"
-
-    # 1. Vuelo directo (benchmark)
-    bump(f"Buscando vuelo directo {origin}→{final_dest}")
-    direct = await gf_search(origin, final_dest, outbound_date)
-    direct_best = min(direct, key=lambda f: f["price"]) if direct else None
-
-    # 2. Por cada hub, buscar los dos tramos
-    hub_results = {}
-    for hub in HUBS:
-        bump(f"Buscando {origin}→{hub}")
-        leg1 = await gf_search(origin, hub, outbound_date)
-
-        # Para el segundo tramo, probar llegada el mismo día y al día siguiente
-        leg2_all = []
-        for offset in [0, 1]:
-            next_date = (datetime.strptime(outbound_date, "%Y-%m-%d")
-                         + timedelta(days=offset)).strftime("%Y-%m-%d")
-            bump(f"Buscando {hub}→{final_dest} el {next_date}")
-            leg2 = await gf_search(hub, final_dest, next_date)
-            leg2_all.extend(leg2)
-
-        hub_results[hub] = {"leg1": leg1, "leg2": leg2_all}
-
-    # 3. Combinar
-    job["progress"] = "Combinando tramos..."
-    for hub, legs in hub_results.items():
-        for l1 in legs["leg1"][:5]:  # top 5 más baratos de cada pierna
-            for l2 in legs["leg2"][:5]:
-                layover_h = estimate_layover_hours(
-                    l1["date"], l1.get("arr_time", ""),
-                    l2["date"], l2.get("dep_time", ""),
-                )
-                if layover_h < min_layover_h or layover_h > max_layover_h:
-                    continue
-                total_price = l1["price"] + l2["price"]
-                all_combos.append({
-                    "hub": hub,
-                    "leg1": l1,
-                    "leg2": l2,
-                    "total_price": total_price,
-                    "layover_hours": round(layover_h, 1),
-                })
-
-    all_combos.sort(key=lambda c: c["total_price"])
-    top_combos = all_combos[:6]  # top 6 para no inflar respuesta
-
-    # 4. Smiles (opcional)
-    smiles_data = {"direct": None, "legs": {}}
+    steps_per_date = 1 + len(HUBS) * 2  # directo + 2 tramos por hub
+    total_steps = steps_per_date * len(sample_dates)
     if include_smiles:
-        job["progress"] = "Consultando Smiles vuelo directo..."
+        total_steps += 1 + len(HUBS) * 2  # conservador
+
+    step = [0]
+    def bump(msg):
+        step[0] += 1
+        job["progress"] = f"[{step[0]}/{total_steps}] {msg}"
+
+    all_directs = []
+    all_combos = []
+
+    for date in sample_dates:
+        short_date = date[5:]  # MM-DD
+
+        # Directo
+        bump(f"Directo {origin}→{final_dest} el {short_date}")
+        direct = await gf_search(origin, final_dest, date)
+        if direct:
+            best_d = min(direct, key=lambda x: x["price"])
+            best_d["_date_searched"] = date
+            all_directs.append(best_d)
+
+        # Hubs
+        for hub in HUBS:
+            bump(f"{origin}→{hub} el {short_date}")
+            leg1 = await gf_search(origin, hub, date)
+
+            # Leg2: probar mismo día y siguiente día
+            leg2_all = []
+            for offset in [0, 1]:
+                nd = (datetime.strptime(date, "%Y-%m-%d") + timedelta(days=offset)).strftime("%Y-%m-%d")
+                if offset == 0:
+                    bump(f"{hub}→{final_dest} el {nd[5:]}")
+                leg2 = await gf_search(hub, final_dest, nd)
+                leg2_all.extend(leg2)
+            # Solo bumpeamos una vez para el par leg1+leg2
+
+            # Combinar (top 5 × top 5)
+            for l1 in leg1[:5]:
+                for l2 in leg2_all[:5]:
+                    layover = estimate_layover_hours(
+                        l1["date"], l1.get("arr_time", ""),
+                        l2["date"], l2.get("dep_time", ""),
+                    )
+                    if layover < min_layover_h or layover > max_layover_h:
+                        continue
+                    all_combos.append({
+                        "hub": hub, "leg1": l1, "leg2": l2,
+                        "total_price": l1["price"] + l2["price"],
+                        "layover_hours": round(layover, 1),
+                        "_date_searched": date,
+                    })
+
+    # Sort
+    all_combos.sort(key=lambda c: c["total_price"])
+    all_directs.sort(key=lambda d: d["price"])
+    top_combos = all_combos[:8]
+    best_direct = all_directs[0] if all_directs else None
+
+    # Smiles opcional
+    smiles_data = {"direct": None, "legs": {}}
+    if include_smiles and top_combos:
+        best_combo_date = top_combos[0]["_date_searched"]
+
+        job["progress"] = f"Smiles directo {best_combo_date[5:]}..."
         try:
-            raw, links = await query_smiles_bot(origin, final_dest, outbound_date, 7)
+            raw, links = await query_smiles_bot(origin, final_dest, best_combo_date, 7)
             smiles_data["direct"] = parse_smiles_response(raw, links)[:3]
         except Exception as e:
-            log.warning(f"Smiles direct error: {e}")
+            log.warning(f"Smiles direct: {e}")
 
-        for hub in HUBS:
-            # Solo consultamos Smiles si hay combo viable con ese hub
-            if not any(c["hub"] == hub for c in top_combos):
-                continue
-            job["progress"] = f"Consultando Smiles {origin}→{hub}..."
-            try:
-                raw, links = await query_smiles_bot(origin, hub, outbound_date, 7)
-                leg1_smiles = parse_smiles_response(raw, links)[:3]
-            except Exception as e:
-                leg1_smiles = []
-                log.warning(f"Smiles {origin}→{hub}: {e}")
+        # Solo hub del mejor combo, para no tardar una eternidad
+        best_hub = top_combos[0]["hub"]
+        job["progress"] = f"Smiles {origin}→{best_hub}..."
+        try:
+            raw, links = await query_smiles_bot(origin, best_hub, best_combo_date, 7)
+            leg1_s = parse_smiles_response(raw, links)[:3]
+        except Exception as e:
+            leg1_s = []
+            log.warning(f"Smiles leg1: {e}")
 
-            job["progress"] = f"Consultando Smiles {hub}→{final_dest}..."
-            try:
-                raw, links = await query_smiles_bot(hub, final_dest, outbound_date, 7)
-                leg2_smiles = parse_smiles_response(raw, links)[:3]
-            except Exception as e:
-                leg2_smiles = []
-                log.warning(f"Smiles {hub}→{final_dest}: {e}")
+        job["progress"] = f"Smiles {best_hub}→{final_dest}..."
+        try:
+            raw, links = await query_smiles_bot(best_hub, final_dest, best_combo_date, 7)
+            leg2_s = parse_smiles_response(raw, links)[:3]
+        except Exception as e:
+            leg2_s = []
+            log.warning(f"Smiles leg2: {e}")
 
-            smiles_data["legs"][hub] = {
-                "leg1": leg1_smiles,
-                "leg2": leg2_smiles,
-            }
+        smiles_data["legs"][best_hub] = {"leg1": leg1_s, "leg2": leg2_s}
 
-    # 5. Resultado final
     job["status"] = "done"
     job["progress"] = "✅ Completado"
     job["result"] = {
-        "origin": origin,
-        "final_dest": final_dest,
-        "outbound_date": outbound_date,
-        "direct": direct_best,
-        "direct_all": direct[:5],
-        "combos": top_combos,
-        "smiles": smiles_data,
-        "hubs_tried": HUBS,
-        "total_combos_found": len(all_combos),
+        "origin": origin, "final_dest": final_dest, "year_month": year_month,
+        "sample_dates": sample_dates,
+        "direct": best_direct, "direct_all": all_directs[:5],
+        "combos": top_combos, "smiles": smiles_data,
+        "hubs_tried": HUBS, "total_combos_found": len(all_combos),
     }
-    log.info(f"Job {job_id} completado: {len(top_combos)} combos")
+    log.info(f"Job {job_id} done: {len(top_combos)} combos, {len(all_directs)} directs")
 
 
-# ═══════════════════════════════════════════════════════════
-# HTTP endpoints
-# ═══════════════════════════════════════════════════════════
+# ═══════════ Direct search (migrado del modo anterior) ═══════════
+async def run_direct_search(job_id: str, origin: str, dest: str, year_month: str,
+                             threshold: int, trip_type: str,
+                             min_days: int, max_days: int):
+    """Búsqueda directa tipo la versión anterior. Con jobs para que no timeouteo."""
+    job = JOBS[job_id]
+    job["status"] = "running"
 
+    if trip_type == "1":
+        min_days = max(3, min_days)
+        max_days = max(min_days, max_days)
+        if max_days - min_days <= 2:
+            stay_options = [min_days]
+        else:
+            stay_options = [min_days, (min_days + max_days) // 2, max_days]
+        outbound_dates = get_sample_dates_for_month(year_month, [7, 17, 27])
+    else:
+        stay_options = [None]
+        outbound_dates = get_sample_dates_for_month(year_month, [3, 10, 17, 24])
+
+    total = len(outbound_dates) * len(stay_options)
+    step = [0]
+    results = []
+
+    for outbound in outbound_dates:
+        for stay in stay_options:
+            step[0] += 1
+            if stay is not None:
+                ret_date = (datetime.strptime(outbound, "%Y-%m-%d") + timedelta(days=stay)).strftime("%Y-%m-%d")
+                job["progress"] = f"[{step[0]}/{total}] {outbound[5:]} → vuelta {ret_date[5:]}"
+                # fast-flights también soporta round-trip
+                try:
+                    r = await asyncio.get_event_loop().run_in_executor(None, _gf_search_sync_rt,
+                                                                         origin, dest, outbound, ret_date)
+                except Exception as e:
+                    log.warning(f"RT error: {e}")
+                    r = []
+            else:
+                job["progress"] = f"[{step[0]}/{total}] {outbound[5:]}"
+                r = await gf_search(origin, dest, outbound)
+
+            if r:
+                best = min(r, key=lambda x: x["price"])
+                if best["price"] <= threshold:
+                    best["return_date"] = ret_date if stay else None
+                    best["stay_days"] = stay
+                    results.append(best)
+
+    results.sort(key=lambda r: r["price"])
+    # Dedupe por fecha
+    unique = {}
+    for r in results:
+        key = (r["date"], r.get("return_date") or "")
+        if key not in unique or r["price"] < unique[key]["price"]:
+            unique[key] = r
+    results = sorted(unique.values(), key=lambda r: r["price"])
+
+    job["status"] = "done"
+    job["progress"] = "✅ Completado"
+    job["result"] = {
+        "origin": origin, "dest": dest, "year_month": year_month,
+        "threshold": threshold, "trip_type": trip_type,
+        "results": results, "count": len(results),
+    }
+
+
+def _gf_search_sync_rt(origin, dest, outbound, return_date):
+    """Round-trip via fast-flights."""
+    if not FAST_FLIGHTS_AVAILABLE:
+        return []
+    try:
+        result = get_flights(
+            flight_data=[
+                FlightData(date=outbound, from_airport=origin, to_airport=dest),
+                FlightData(date=return_date, from_airport=dest, to_airport=origin),
+            ],
+            trip="round-trip", seat="economy",
+            passengers=Passengers(adults=1),
+            fetch_mode="fallback",
+        )
+        out = []
+        for f in (getattr(result, "flights", []) or []):
+            price_str = getattr(f, "price", "") or ""
+            digits = "".join(c for c in str(price_str) if c.isdigit())
+            if not digits:
+                continue
+            stops_v = getattr(f, "stops", 0)
+            if isinstance(stops_v, str):
+                sd = "".join(c for c in stops_v if c.isdigit())
+                stops_n = int(sd) if sd else 0
+            else:
+                stops_n = int(stops_v) if stops_v else 0
+            out.append({
+                "origin": origin, "dest": dest, "date": outbound,
+                "return_date": return_date,
+                "price": int(digits),
+                "airline": getattr(f, "name", "") or "?",
+                "stops": stops_n,
+                "duration": getattr(f, "duration", "") or "",
+            })
+        return sorted(out, key=lambda x: x["price"])
+    except Exception as e:
+        log.warning(f"RT fast-flights {origin}→{dest}: {e}")
+        return []
+
+
+# ═══════════ HTTP endpoints ═══════════
 def _auth(request):
     key = request.headers.get("X-Worker-Key") or request.query.get("key")
     return key == WORKER_KEY
 
 
-async def handle_search(request: web.Request):
-    """Búsqueda Smiles directa (como antes)."""
+async def handle_smiles_search(request: web.Request):
     if not _auth(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
-
     origin = request.query.get("origin", "").upper()
     dest   = request.query.get("dest",   "").upper()
     date   = request.query.get("date",   "")
     days   = int(request.query.get("days", "7"))
-
     if not (origin and dest and date):
         return web.json_response({"error": "origin, dest, date requeridos"}, status=400)
-
     try:
         raw, links = await query_smiles_bot(origin, dest, date, days)
         results = parse_smiles_response(raw, links)
@@ -405,45 +505,56 @@ async def handle_search(request: web.Request):
         return web.json_response({"error": str(e)}, status=500)
 
 
-async def handle_combo_start(request: web.Request):
-    """Inicia búsqueda combinada, devuelve job_id para polling."""
+async def handle_direct_start(request: web.Request):
     if not _auth(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
+    dest       = request.query.get("dest", "").upper()
+    year_month = request.query.get("month", "")
+    threshold  = int(request.query.get("threshold", "1500"))
+    trip_type  = request.query.get("trip_type", "2")
+    min_days   = int(request.query.get("min_days", "14"))
+    max_days   = int(request.query.get("max_days", "21"))
 
-    origin     = request.query.get("origin", "EZE").upper()
-    final_dest = request.query.get("dest", "").upper()
-    date       = request.query.get("date", "")
-    min_layover = int(request.query.get("min_layover", "6"))
-    max_layover = int(request.query.get("max_layover", "24"))
-    include_smiles = request.query.get("smiles", "true").lower() == "true"
-
-    if not final_dest or not date:
-        return web.json_response({"error": "dest y date requeridos"}, status=400)
+    if not dest or not year_month:
+        return web.json_response({"error": "dest y month requeridos"}, status=400)
 
     job_id = str(uuid.uuid4())[:12]
-    JOBS[job_id] = {
-        "status": "queued", "progress": "Iniciando...",
-        "result": None, "started_at": datetime.now().isoformat(),
-    }
-
-    # Arrancar en background
-    asyncio.create_task(run_combo_search(
-        job_id, origin, final_dest, date, min_layover, max_layover, include_smiles
+    JOBS[job_id] = {"status": "queued", "progress": "Iniciando...",
+                    "result": None, "started_at": datetime.now().isoformat()}
+    asyncio.create_task(run_direct_search(
+        job_id, "EZE", dest, year_month, threshold, trip_type, min_days, max_days
     ))
-
     return web.json_response({"job_id": job_id, "status": "queued"})
 
 
-async def handle_combo_status(request: web.Request):
-    """Consultar estado de un job."""
+async def handle_combo_start(request: web.Request):
     if not _auth(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
+    dest       = request.query.get("dest", "").upper()
+    year_month = request.query.get("month", "")
+    min_lo     = int(request.query.get("min_layover", "6"))
+    max_lo     = int(request.query.get("max_layover", "24"))
+    smiles     = request.query.get("smiles", "true").lower() == "true"
 
+    if not dest or not year_month:
+        return web.json_response({"error": "dest y month requeridos"}, status=400)
+
+    job_id = str(uuid.uuid4())[:12]
+    JOBS[job_id] = {"status": "queued", "progress": "Iniciando...",
+                    "result": None, "started_at": datetime.now().isoformat()}
+    asyncio.create_task(run_combo_search(
+        job_id, "EZE", dest, year_month, min_lo, max_lo, smiles
+    ))
+    return web.json_response({"job_id": job_id, "status": "queued"})
+
+
+async def handle_job_status(request: web.Request):
+    if not _auth(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
     job_id = request.query.get("job_id", "")
     job = JOBS.get(job_id)
     if not job:
         return web.json_response({"error": "Job no encontrado"}, status=404)
-
     return web.json_response({
         "job_id":   job_id,
         "status":   job["status"],
@@ -454,12 +565,10 @@ async def handle_combo_status(request: web.Request):
 
 async def handle_health(request: web.Request):
     return web.json_response({
-        "status":    "ok",
-        "connected": client.is_connected(),
+        "status": "ok", "connected": client.is_connected(),
         "fast_flights": FAST_FLIGHTS_AVAILABLE,
-        "hubs":      HUBS,
-        "jobs":      len(JOBS),
-        "time":      datetime.now().isoformat(),
+        "hubs": HUBS, "jobs": len(JOBS),
+        "time": datetime.now().isoformat(),
     })
 
 
@@ -468,43 +577,35 @@ async def handle_root(request: web.Request):
 
 
 async def cleanup_old_jobs():
-    """Limpia jobs viejos cada 10 min."""
     while True:
         await asyncio.sleep(600)
         now = datetime.now()
-        to_remove = []
-        for jid, job in JOBS.items():
-            try:
-                started = datetime.fromisoformat(job["started_at"])
-                if (now - started).total_seconds() > 3600:  # 1 hora
-                    to_remove.append(jid)
-            except Exception:
-                pass
-        for jid in to_remove:
+        remove = [jid for jid, job in JOBS.items()
+                  if (now - datetime.fromisoformat(job["started_at"])).total_seconds() > 3600]
+        for jid in remove:
             JOBS.pop(jid, None)
-        log.info(f"Cleanup: removidos {len(to_remove)} jobs viejos")
 
 
 async def main():
-    log.info(f"fast-flights disponible: {FAST_FLIGHTS_AVAILABLE}")
+    log.info(f"fast-flights: {FAST_FLIGHTS_AVAILABLE}")
     log.info("Conectando a Telegram...")
     await client.start()
     me = await client.get_me()
     log.info(f"✅ Conectado como: {me.first_name}")
 
     app = web.Application()
-    app.router.add_get("/",             handle_root)
-    app.router.add_get("/health",       handle_health)
-    app.router.add_get("/search",       handle_search)
-    app.router.add_get("/combo/start",  handle_combo_start)
-    app.router.add_get("/combo/status", handle_combo_status)
+    app.router.add_get("/",              handle_root)
+    app.router.add_get("/health",        handle_health)
+    app.router.add_get("/search",        handle_smiles_search)  # smiles directo (legacy)
+    app.router.add_get("/direct/start",  handle_direct_start)
+    app.router.add_get("/combo/start",   handle_combo_start)
+    app.router.add_get("/combo/status",  handle_job_status)     # same for both
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info(f"🌐 Escuchando en puerto {PORT}")
-
+    log.info(f"🌐 Port {PORT}")
     asyncio.create_task(cleanup_old_jobs())
     await asyncio.Event().wait()
 
