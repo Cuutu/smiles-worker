@@ -24,6 +24,12 @@ try:
 except ImportError:
     FAST_FLIGHTS_AVAILABLE = False
 
+try:
+    from amadeus import Client as AmadeusClient, ResponseError as AmadeusResponseError
+    AMADEUS_SDK_AVAILABLE = True
+except ImportError:
+    AMADEUS_SDK_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smiles-worker")
 
@@ -36,6 +42,23 @@ WORKER_KEY = os.environ.get("WORKER_SECRET", "change-me")
 PORT       = int(os.environ.get("PORT", "8080"))
 
 SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
+
+# Amadeus Self-Service API
+AMADEUS_ID       = os.environ.get("AMADEUS_CLIENT_ID", "")
+AMADEUS_SECRET   = os.environ.get("AMADEUS_CLIENT_SECRET", "")
+AMADEUS_HOSTNAME = os.environ.get("AMADEUS_HOSTNAME", "test")  # "test" o "production"
+
+amadeus_client = None
+if AMADEUS_SDK_AVAILABLE and AMADEUS_ID and AMADEUS_SECRET:
+    try:
+        amadeus_client = AmadeusClient(
+            client_id=AMADEUS_ID,
+            client_secret=AMADEUS_SECRET,
+            hostname=AMADEUS_HOSTNAME,
+        )
+    except Exception as e:
+        logging.warning(f"Amadeus init falló: {e}")
+        amadeus_client = None
 
 if SESSION_STRING:
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -77,6 +100,12 @@ HUB_CODES = list(HUBS.keys())
 MAX_CONCURRENT_GF = 8
 
 JOBS = {}
+
+# Cache in-memory de resultados de fast-flights
+# key: (origin, dest, date, return_date or "") -> (timestamp, results)
+GF_CACHE = {}
+GF_CACHE_TTL = 1800  # 30 min
+GF_CACHE_LOCK = asyncio.Lock()
 
 
 # ═══════════════════════════════════════════════
@@ -211,6 +240,8 @@ def _gf_search_sync(origin, dest, date):
             if not digits:
                 continue
             price = int(digits)
+            if price < 50:
+                continue
             airline = getattr(f, "name", "") or "?"
             stops_v = getattr(f, "stops", 0)
             if isinstance(stops_v, str):
@@ -250,6 +281,8 @@ def _gf_search_sync_rt(origin, dest, outbound, return_date):
             digits = "".join(c for c in str(price_str) if c.isdigit())
             if not digits:
                 continue
+            if int(digits) < 50:
+                continue
             stops_v = getattr(f, "stops", 0)
             if isinstance(stops_v, str):
                 sd = "".join(c for c in stops_v if c.isdigit())
@@ -271,16 +304,35 @@ def _gf_search_sync_rt(origin, dest, outbound, return_date):
 
 
 async def gf_search(origin, dest, date, rt_return=None):
-    """Wrapped en semáforo para limitar concurrencia."""
+    """Wrapped en semáforo + cache TTL 30min."""
     global _gf_semaphore
     if _gf_semaphore is None:
         _gf_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GF)
 
+    cache_key = (origin, dest, date, rt_return or "")
+    now = asyncio.get_event_loop().time()
+
+    async with GF_CACHE_LOCK:
+        hit = GF_CACHE.get(cache_key)
+        if hit and (now - hit[0]) < GF_CACHE_TTL:
+            return hit[1]
+
     async with _gf_semaphore:
         loop = asyncio.get_event_loop()
         if rt_return:
-            return await loop.run_in_executor(None, _gf_search_sync_rt, origin, dest, date, rt_return)
-        return await loop.run_in_executor(None, _gf_search_sync, origin, dest, date)
+            res = await loop.run_in_executor(None, _gf_search_sync_rt, origin, dest, date, rt_return)
+        else:
+            res = await loop.run_in_executor(None, _gf_search_sync, origin, dest, date)
+
+    async with GF_CACHE_LOCK:
+        GF_CACHE[cache_key] = (asyncio.get_event_loop().time(), res)
+        # Limpieza oportunista: remover entradas vencidas si el cache creció
+        if len(GF_CACHE) > 2000:
+            cutoff = asyncio.get_event_loop().time() - GF_CACHE_TTL
+            for k in [k for k, v in GF_CACHE.items() if v[0] < cutoff]:
+                GF_CACHE.pop(k, None)
+
+    return res
 
 
 # ═══════════════════════════════════════════════
@@ -328,51 +380,118 @@ def get_sample_dates_for_month(year_month: str, samples=None) -> list:
     return dates
 
 
+def _best_combo_per_hub_date(legs1_by_hd, legs2_by_hd, date,
+                               min_layover_h, max_layover_h):
+    """
+    Dada una fecha y los dicts por (hub, date), devuelve el mejor combo
+    por cada hub (leg1 + leg2) que respete el layover.
+    Retorna lista de dicts: {hub, leg1, leg2, total, layover_hours}.
+    """
+    out = []
+    for hub in HUB_CODES:
+        leg1s = sorted(legs1_by_hd.get((hub, date), []), key=lambda x: x["price"])[:5]
+        leg2s = sorted(legs2_by_hd.get((hub, date), []), key=lambda x: x["price"])[:5]
+        best = None
+        for l1 in leg1s:
+            for l2 in leg2s:
+                layover = estimate_layover_hours(
+                    l1["date"], l1.get("arr_time", ""),
+                    l2["date"], l2.get("dep_time", ""),
+                )
+                if layover < min_layover_h or layover > max_layover_h:
+                    continue
+                total = l1["price"] + l2["price"]
+                if best is None or total < best["total"]:
+                    best = {
+                        "hub": hub,
+                        "leg1": l1, "leg2": l2,
+                        "total": total,
+                        "layover_hours": round(layover, 1),
+                    }
+        if best:
+            out.append(best)
+    return out
+
+
 async def run_combo_search(job_id: str, origin: str, final_dest: str,
                             year_month: str, min_layover_h: int, max_layover_h: int,
-                            include_smiles: bool):
+                            include_smiles: bool,
+                            min_stay_days: int = 14, max_stay_days: int = 21):
     """
-    Busca en paralelo:
-      - Directo EZE→dest por cada fecha de muestra
-      - Por cada hub: EZE→hub + hub→dest (mismo día + siguiente día)
-    Combina todo y filtra por layover.
+    Round-trip combo. Busca en paralelo:
+      - Ida: EZE→hub→dest, por varias fechas y cada hub
+      - Vuelta: dest→hub→EZE, por varias fechas (outbound + stay) y cada hub
+      - Directo ida+vuelta de referencia
+    Combina permitiendo hubs distintos en ida y vuelta.
     """
     job = JOBS[job_id]
     job["status"] = "running"
 
-    sample_dates = get_sample_dates_for_month(year_month)
-    if not sample_dates:
+    out_dates = get_sample_dates_for_month(year_month)
+    if not out_dates:
         job["status"] = "done"
         job["progress"] = "✅ Sin fechas válidas"
         job["result"] = {"error": "Sin fechas futuras en ese mes", "combos": []}
         return
 
-    job["progress"] = f"🔍 Armando {len(HUB_CODES) * len(sample_dates) * 3 + len(sample_dates)} búsquedas en paralelo..."
+    # Muestreo de stay: min, mid, max (si max-min pequeño usa solo uno)
+    if max_stay_days - min_stay_days <= 2:
+        stay_samples = [min_stay_days]
+    elif max_stay_days - min_stay_days <= 6:
+        stay_samples = [min_stay_days, max_stay_days]
+    else:
+        stay_samples = [min_stay_days, (min_stay_days + max_stay_days) // 2, max_stay_days]
 
-    # Armamos TODAS las tareas y las disparamos en paralelo (el semáforo regula)
+    # Fechas de vuelta únicas (out + stay)
+    ret_dates_set = set()
+    out_to_rets = {}  # out_date -> [ret_date, ...]
+    for od in out_dates:
+        rets = []
+        for s in stay_samples:
+            rd = (datetime.strptime(od, "%Y-%m-%d") + timedelta(days=s)).strftime("%Y-%m-%d")
+            ret_dates_set.add(rd)
+            rets.append((s, rd))
+        out_to_rets[od] = rets
+    ret_dates = sorted(ret_dates_set)
+
+    # Armar tareas
     tasks = []
-    task_descriptors = []  # para saber qué es cada tarea al terminarla
+    desc = []  # (kind, date, hub)
 
-    for date in sample_dates:
-        # Directo
-        tasks.append(gf_search(origin, final_dest, date))
-        task_descriptors.append(("direct", date, None, None))
+    # Directo ida (referencia): 1 por out_date
+    for od in out_dates:
+        tasks.append(gf_search(origin, final_dest, od))
+        desc.append(("direct_out", od, None))
 
+    # Directo vuelta (referencia): 1 por ret_date
+    for rd in ret_dates:
+        tasks.append(gf_search(final_dest, origin, rd))
+        desc.append(("direct_back", rd, None))
+
+    # Ida: EZE→hub + hub→dest por cada out_date y hub
+    for od in out_dates:
         for hub in HUB_CODES:
-            # Leg 1: EZE → hub (mismo día)
-            tasks.append(gf_search(origin, hub, date))
-            task_descriptors.append(("leg1", date, hub, None))
-
-            # Leg 2: hub → dest (mismo día y al día siguiente)
+            tasks.append(gf_search(origin, hub, od))
+            desc.append(("out_leg1", od, hub))
             for offset in [0, 1]:
-                nd = (datetime.strptime(date, "%Y-%m-%d") + timedelta(days=offset)).strftime("%Y-%m-%d")
+                nd = (datetime.strptime(od, "%Y-%m-%d") + timedelta(days=offset)).strftime("%Y-%m-%d")
                 tasks.append(gf_search(hub, final_dest, nd))
-                task_descriptors.append(("leg2", date, hub, nd))
+                desc.append(("out_leg2", od, hub))
+
+    # Vuelta: dest→hub + hub→EZE por cada ret_date y hub
+    for rd in ret_dates:
+        for hub in HUB_CODES:
+            tasks.append(gf_search(final_dest, hub, rd))
+            desc.append(("back_leg1", rd, hub))
+            for offset in [0, 1]:
+                nd = (datetime.strptime(rd, "%Y-%m-%d") + timedelta(days=offset)).strftime("%Y-%m-%d")
+                tasks.append(gf_search(hub, origin, nd))
+                desc.append(("back_leg2", rd, hub))
 
     total = len(tasks)
-    log.info(f"Job {job_id}: {total} búsquedas en paralelo ({MAX_CONCURRENT_GF} simultáneas)")
+    log.info(f"Job {job_id}: {total} búsquedas (ida+vuelta) en paralelo ({MAX_CONCURRENT_GF} simultáneas)")
+    job["progress"] = f"🔍 {total} búsquedas en paralelo..."
 
-    # Ejecutar todas, con progreso en vivo
     results_indexed = [None] * total
     completed = [0]
 
@@ -381,103 +500,173 @@ async def run_combo_search(job_id: str, origin: str, final_dest: str,
             results_indexed[i] = await coro
         finally:
             completed[0] += 1
-            if completed[0] % 5 == 0 or completed[0] == total:
+            if completed[0] % 10 == 0 or completed[0] == total:
                 job["progress"] = f"🔍 {completed[0]}/{total} búsquedas completadas..."
 
     await asyncio.gather(*[run_one(i, t) for i, t in enumerate(tasks)])
 
-    # Organizar por tipo
-    directs_by_date = {}        # date → [flights]
-    legs1_by_hub_date = {}      # (hub, date) → [flights]
-    legs2_by_hub_date = {}      # (hub, date_origin) → [flights from any leg2 offset]
+    # Organizar
+    direct_out_by_date = {}
+    direct_back_by_date = {}
+    out_leg1_by_hd = {}
+    out_leg2_by_hd = {}
+    back_leg1_by_hd = {}
+    back_leg2_by_hd = {}
 
-    for i, (kind, date, hub, extra_date) in enumerate(task_descriptors):
+    for i, (kind, date, hub) in enumerate(desc):
         res = results_indexed[i] or []
-        if kind == "direct":
-            directs_by_date.setdefault(date, []).extend(res)
-        elif kind == "leg1":
-            legs1_by_hub_date.setdefault((hub, date), []).extend(res)
-        elif kind == "leg2":
-            legs2_by_hub_date.setdefault((hub, date), []).extend(res)
+        if kind == "direct_out":
+            direct_out_by_date.setdefault(date, []).extend(res)
+        elif kind == "direct_back":
+            direct_back_by_date.setdefault(date, []).extend(res)
+        elif kind == "out_leg1":
+            out_leg1_by_hd.setdefault((hub, date), []).extend(res)
+        elif kind == "out_leg2":
+            out_leg2_by_hd.setdefault((hub, date), []).extend(res)
+        elif kind == "back_leg1":
+            back_leg1_by_hd.setdefault((hub, date), []).extend(res)
+        elif kind == "back_leg2":
+            back_leg2_by_hd.setdefault((hub, date), []).extend(res)
 
     # Combinar
-    job["progress"] = "🧩 Combinando tramos..."
+    job["progress"] = "🧩 Combinando tramos ida + vuelta..."
+
+    # Mejor combo de ida por (out_date, hub)
+    outbound_combos_by_date = {}  # out_date -> [combo ida]
+    for od in out_dates:
+        outbound_combos_by_date[od] = _best_combo_per_hub_date(
+            out_leg1_by_hd, out_leg2_by_hd, od, min_layover_h, max_layover_h
+        )
+
+    # Mejor combo de vuelta por (ret_date, hub)
+    return_combos_by_date = {}  # ret_date -> [combo vuelta]
+    for rd in ret_dates:
+        return_combos_by_date[rd] = _best_combo_per_hub_date(
+            back_leg1_by_hd, back_leg2_by_hd, rd, min_layover_h, max_layover_h
+        )
+
+    # Directos ida/vuelta por fecha
+    best_direct_out_by_date = {
+        od: min(flights, key=lambda x: x["price"])
+        for od, flights in direct_out_by_date.items() if flights
+    }
+    best_direct_back_by_date = {
+        rd: min(flights, key=lambda x: x["price"])
+        for rd, flights in direct_back_by_date.items() if flights
+    }
+
+    # Armar round-trip combos: mejor ida + mejor vuelta (por pares out/ret válidos)
     all_combos = []
-    all_directs = []
+    for od in out_dates:
+        out_list = outbound_combos_by_date.get(od, [])
+        if not out_list:
+            continue
+        for stay, rd in out_to_rets[od]:
+            ret_list = return_combos_by_date.get(rd, [])
+            if not ret_list:
+                continue
+            # Permitimos hubs distintos → best out × best back independientes
+            best_out = min(out_list, key=lambda c: c["total"])
+            best_back = min(ret_list, key=lambda c: c["total"])
 
-    for date in sample_dates:
-        d_flights = directs_by_date.get(date, [])
-        if d_flights:
-            best_d = min(d_flights, key=lambda x: x["price"])
-            all_directs.append(best_d)
-
-        for hub in HUB_CODES:
-            leg1s = sorted(legs1_by_hub_date.get((hub, date), []), key=lambda x: x["price"])[:5]
-            leg2s = sorted(legs2_by_hub_date.get((hub, date), []), key=lambda x: x["price"])[:5]
-
-            for l1 in leg1s:
-                for l2 in leg2s:
-                    layover = estimate_layover_hours(
-                        l1["date"], l1.get("arr_time", ""),
-                        l2["date"], l2.get("dep_time", ""),
-                    )
-                    if layover < min_layover_h or layover > max_layover_h:
-                        continue
+            # Además probamos todos los pares para no perder combos
+            # donde un hub "caro de ida" sea "barato de vuelta"
+            for o in out_list[:5]:
+                for b in ret_list[:5]:
+                    total = o["total"] + b["total"]
                     all_combos.append({
-                        "hub": hub,
-                        "hub_name": HUBS[hub]["name"],
-                        "hub_region": HUBS[hub]["region"],
-                        "leg1": l1, "leg2": l2,
-                        "total_price": l1["price"] + l2["price"],
-                        "layover_hours": round(layover, 1),
-                        "_date_searched": date,
+                        "hub_out":  o["hub"],
+                        "hub_back": b["hub"],
+                        "hub_out_name":  HUBS[o["hub"]]["name"],
+                        "hub_back_name": HUBS[b["hub"]]["name"],
+                        "out_leg1": o["leg1"], "out_leg2": o["leg2"],
+                        "back_leg1": b["leg1"], "back_leg2": b["leg2"],
+                        "out_layover_hours":  o["layover_hours"],
+                        "back_layover_hours": b["layover_hours"],
+                        "total_price": total,
+                        "out_date": od,
+                        "return_date": rd,
+                        "stay_days": stay,
                     })
 
-    all_combos.sort(key=lambda c: c["total_price"])
-    all_directs.sort(key=lambda d: d["price"])
+    # Dedupe por (hub_out, hub_back, out_date, return_date) quedándonos con el más barato
+    uniq = {}
+    for c in all_combos:
+        k = (c["hub_out"], c["hub_back"], c["out_date"], c["return_date"])
+        if k not in uniq or c["total_price"] < uniq[k]["total_price"]:
+            uniq[k] = c
+    all_combos = sorted(uniq.values(), key=lambda c: c["total_price"])
     top_combos = all_combos[:10]
-    best_direct = all_directs[0] if all_directs else None
 
-    # Smiles opcional (solo mejor combo)
-    smiles_data = {"direct": None, "legs": {}}
+    # Directo round-trip de referencia (mejor combinación out+back directos)
+    best_direct_rt = None
+    for od in out_dates:
+        if od not in best_direct_out_by_date:
+            continue
+        for stay, rd in out_to_rets[od]:
+            if rd not in best_direct_back_by_date:
+                continue
+            total = best_direct_out_by_date[od]["price"] + best_direct_back_by_date[rd]["price"]
+            if best_direct_rt is None or total < best_direct_rt["total_price"]:
+                best_direct_rt = {
+                    "out":    best_direct_out_by_date[od],
+                    "back":   best_direct_back_by_date[rd],
+                    "total_price": total,
+                    "out_date": od, "return_date": rd, "stay_days": stay,
+                }
+
+    # Smiles opcional (solo mejor combo — 4 tramos)
+    smiles_data = {"direct_out": None, "direct_back": None, "legs": {}}
     if include_smiles and top_combos:
         best = top_combos[0]
-        best_date = best["_date_searched"]
+        od, rd = best["out_date"], best["return_date"]
+        ho, hb = best["hub_out"], best["hub_back"]
 
-        job["progress"] = f"🎫 Smiles {origin}→{final_dest}..."
-        try:
-            raw, links = await query_smiles_bot(origin, final_dest, best_date, 7)
-            smiles_data["direct"] = parse_smiles_response(raw, links)[:3]
-        except Exception as e:
-            log.warning(f"Smiles direct: {e}")
+        async def safe_smiles(o, d, date):
+            try:
+                raw, links = await query_smiles_bot(o, d, date, 7)
+                return parse_smiles_response(raw, links)[:3]
+            except Exception as e:
+                log.warning(f"Smiles {o}→{d} {date}: {e}")
+                return []
 
-        job["progress"] = f"🎫 Smiles {origin}→{best['hub']}..."
-        try:
-            raw, links = await query_smiles_bot(origin, best["hub"], best_date, 7)
-            leg1_s = parse_smiles_response(raw, links)[:3]
-        except Exception as e:
-            leg1_s = []
+        job["progress"] = f"🎫 Smiles directo ida {origin}→{final_dest}..."
+        smiles_data["direct_out"] = await safe_smiles(origin, final_dest, od)
 
-        job["progress"] = f"🎫 Smiles {best['hub']}→{final_dest}..."
-        try:
-            raw, links = await query_smiles_bot(best["hub"], final_dest, best_date, 7)
-            leg2_s = parse_smiles_response(raw, links)[:3]
-        except Exception as e:
-            leg2_s = []
+        job["progress"] = f"🎫 Smiles directo vuelta {final_dest}→{origin}..."
+        smiles_data["direct_back"] = await safe_smiles(final_dest, origin, rd)
 
-        smiles_data["legs"][best["hub"]] = {"leg1": leg1_s, "leg2": leg2_s}
+        job["progress"] = f"🎫 Smiles ida {origin}→{ho}..."
+        out_l1 = await safe_smiles(origin, ho, od)
+
+        job["progress"] = f"🎫 Smiles ida {ho}→{final_dest}..."
+        out_l2 = await safe_smiles(ho, final_dest, od)
+
+        job["progress"] = f"🎫 Smiles vuelta {final_dest}→{hb}..."
+        back_l1 = await safe_smiles(final_dest, hb, rd)
+
+        job["progress"] = f"🎫 Smiles vuelta {hb}→{origin}..."
+        back_l2 = await safe_smiles(hb, origin, rd)
+
+        smiles_data["legs"] = {
+            "out":  {"hub": ho, "leg1": out_l1,  "leg2": out_l2},
+            "back": {"hub": hb, "leg1": back_l1, "leg2": back_l2},
+        }
 
     job["status"] = "done"
     job["progress"] = "✅ Completado"
     job["result"] = {
         "origin": origin, "final_dest": final_dest, "year_month": year_month,
-        "sample_dates": sample_dates,
-        "direct": best_direct, "direct_all": all_directs[:5],
-        "combos": top_combos, "smiles": smiles_data,
+        "sample_dates": out_dates,
+        "return_dates": ret_dates,
+        "min_stay_days": min_stay_days, "max_stay_days": max_stay_days,
+        "direct_rt": best_direct_rt,
+        "combos": top_combos,
+        "smiles": smiles_data,
         "hubs_tried": [{"code": h, **HUBS[h]} for h in HUB_CODES],
         "total_combos_found": len(all_combos),
     }
-    log.info(f"Job {job_id} done: {len(top_combos)} combos de {len(all_combos)} analizados")
+    log.info(f"Job {job_id} done: {len(top_combos)} combos RT de {len(all_combos)} analizados")
 
 
 # ═══════════════════════════════════════════════
@@ -555,6 +744,121 @@ async def run_direct_search(job_id: str, origin: str, dest: str, year_month: str
 
 
 # ═══════════════════════════════════════════════
+# Amadeus Self-Service (motor alternativo estable)
+# ═══════════════════════════════════════════════
+def _amadeus_parse_offer(offer: dict) -> dict:
+    """Transforma una offer de Amadeus al schema simple que usa el frontend."""
+    try:
+        price = float(offer["price"]["total"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    currency = offer.get("price", {}).get("currency", "USD")
+
+    itineraries = []
+    for itin in offer.get("itineraries", []):
+        segs = itin.get("segments", []) or []
+        if not segs:
+            continue
+        first, last = segs[0], segs[-1]
+        itineraries.append({
+            "origin":   first.get("departure", {}).get("iataCode", ""),
+            "dest":     last.get("arrival", {}).get("iataCode", ""),
+            "dep_time": first.get("departure", {}).get("at", ""),
+            "arr_time": last.get("arrival", {}).get("at", ""),
+            "duration": itin.get("duration", ""),
+            "stops":    max(0, len(segs) - 1),
+            "segments": [{
+                "from":    s.get("departure", {}).get("iataCode", ""),
+                "to":      s.get("arrival", {}).get("iataCode", ""),
+                "dep":     s.get("departure", {}).get("at", ""),
+                "arr":     s.get("arrival", {}).get("at", ""),
+                "carrier": s.get("carrierCode", ""),
+                "number":  s.get("number", ""),
+                "duration": s.get("duration", ""),
+            } for s in segs],
+        })
+
+    airline_codes = offer.get("validatingAirlineCodes", []) or []
+    return {
+        "price": price,
+        "currency": currency,
+        "airlines": airline_codes,
+        "itineraries": itineraries,
+        "bookable_seats": offer.get("numberOfBookableSeats"),
+        "last_ticket_date": offer.get("lastTicketingDate"),
+    }
+
+
+def _amadeus_search_sync(origin, dest, date, return_date=None, adults=1,
+                          non_stop=False, max_offers=8, via=None):
+    """
+    Búsqueda sync (corre en executor).
+    `via`: hub IATA opcional. Si está, forza multi-city origin→via→dest (ida) y
+    espejo en vuelta si hay return_date.
+    """
+    if not amadeus_client:
+        return {"error": "Amadeus no configurado", "offers": []}
+
+    try:
+        if via:
+            # Multi-city: cada tramo como origin_destinations
+            origin_dests = [
+                {"id": "1", "originLocationCode": origin, "destinationLocationCode": via,
+                 "departureDateTimeRange": {"date": date}},
+                {"id": "2", "originLocationCode": via, "destinationLocationCode": dest,
+                 "departureDateTimeRange": {"date": date}},
+            ]
+            if return_date:
+                origin_dests += [
+                    {"id": "3", "originLocationCode": dest, "destinationLocationCode": via,
+                     "departureDateTimeRange": {"date": return_date}},
+                    {"id": "4", "originLocationCode": via, "destinationLocationCode": origin,
+                     "departureDateTimeRange": {"date": return_date}},
+                ]
+            body = {
+                "currencyCode": "USD",
+                "originDestinations": origin_dests,
+                "travelers": [{"id": str(i+1), "travelerType": "ADULT"} for i in range(adults)],
+                "sources": ["GDS"],
+                "searchCriteria": {"maxFlightOffers": max_offers},
+            }
+            resp = amadeus_client.shopping.flight_offers_search.post(body)
+        else:
+            params = {
+                "originLocationCode": origin,
+                "destinationLocationCode": dest,
+                "departureDate": date,
+                "adults": adults,
+                "currencyCode": "USD",
+                "max": max_offers,
+            }
+            if return_date:
+                params["returnDate"] = return_date
+            if non_stop:
+                params["nonStop"] = "true"
+            resp = amadeus_client.shopping.flight_offers_search.get(**params)
+
+        raw = resp.data or []
+        parsed = [p for p in (_amadeus_parse_offer(o) for o in raw) if p]
+        parsed.sort(key=lambda x: x["price"])
+        return {"offers": parsed, "count": len(parsed)}
+    except AmadeusResponseError as e:
+        return {"error": f"Amadeus error: {e}", "offers": []}
+    except Exception as e:
+        log.exception("Amadeus unexpected")
+        return {"error": str(e), "offers": []}
+
+
+async def amadeus_search(origin, dest, date, return_date=None, adults=1,
+                          non_stop=False, max_offers=8, via=None):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, _amadeus_search_sync,
+        origin, dest, date, return_date, adults, non_stop, max_offers, via,
+    )
+
+
+# ═══════════════════════════════════════════════
 # HTTP endpoints
 # ═══════════════════════════════════════════════
 def _auth(request):
@@ -616,15 +920,19 @@ async def handle_combo_start(request: web.Request):
     min_lo     = int(request.query.get("min_layover", "6"))
     max_lo     = int(request.query.get("max_layover", "24"))
     smiles     = request.query.get("smiles", "true").lower() == "true"
+    min_days   = int(request.query.get("min_days", "14"))
+    max_days   = int(request.query.get("max_days", "21"))
 
     if not dest or not year_month:
         return web.json_response({"error": "dest y month requeridos"}, status=400)
+    if min_days < 1: min_days = 1
+    if max_days < min_days: max_days = min_days
 
     job_id = str(uuid.uuid4())[:12]
     JOBS[job_id] = {"status": "queued", "progress": "Iniciando...",
                     "result": None, "started_at": datetime.now().isoformat()}
     asyncio.create_task(run_combo_search(
-        job_id, "EZE", dest, year_month, min_lo, max_lo, smiles
+        job_id, "EZE", dest, year_month, min_lo, max_lo, smiles, min_days, max_days
     ))
     return web.json_response({"job_id": job_id, "status": "queued"})
 
@@ -644,13 +952,53 @@ async def handle_job_status(request: web.Request):
     })
 
 
+async def handle_amadeus_search(request: web.Request):
+    if not _auth(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    if not amadeus_client:
+        return web.json_response(
+            {"error": "Amadeus no configurado (faltan AMADEUS_CLIENT_ID/SECRET)"},
+            status=503,
+        )
+    origin      = request.query.get("origin", "").upper()
+    dest        = request.query.get("dest", "").upper()
+    date        = request.query.get("date", "")
+    return_date = request.query.get("return_date", "") or None
+    via         = (request.query.get("via", "") or "").upper() or None
+    adults      = int(request.query.get("adults", "1"))
+    non_stop    = request.query.get("non_stop", "false").lower() == "true"
+    max_offers  = int(request.query.get("max", "8"))
+
+    if not (origin and dest and date):
+        return web.json_response({"error": "origin, dest, date requeridos"}, status=400)
+
+    try:
+        res = await amadeus_search(
+            origin, dest, date, return_date=return_date,
+            adults=adults, non_stop=non_stop, max_offers=max_offers, via=via,
+        )
+        return web.json_response({
+            "origin": origin, "dest": dest, "date": date,
+            "return_date": return_date, "via": via,
+            "hostname": AMADEUS_HOSTNAME,
+            **res,
+            "at": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        log.exception("amadeus endpoint")
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def handle_health(request: web.Request):
     return web.json_response({
         "status": "ok", "connected": client.is_connected(),
         "fast_flights": FAST_FLIGHTS_AVAILABLE,
+        "amadeus": bool(amadeus_client),
+        "amadeus_hostname": AMADEUS_HOSTNAME if amadeus_client else None,
         "hubs": len(HUB_CODES),
         "concurrent_gf": MAX_CONCURRENT_GF,
         "jobs": len(JOBS),
+        "cache_size": len(GF_CACHE),
         "time": datetime.now().isoformat(),
     })
 
@@ -688,6 +1036,7 @@ async def main():
     app.router.add_get("/direct/start",  handle_direct_start)
     app.router.add_get("/combo/start",   handle_combo_start)
     app.router.add_get("/combo/status",  handle_job_status)
+    app.router.add_get("/amadeus/search", handle_amadeus_search)
 
     runner = web.AppRunner(app)
     await runner.setup()
