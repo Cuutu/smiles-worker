@@ -24,12 +24,6 @@ try:
 except ImportError:
     FAST_FLIGHTS_AVAILABLE = False
 
-try:
-    from amadeus import Client as AmadeusClient, ResponseError as AmadeusResponseError
-    AMADEUS_SDK_AVAILABLE = True
-except ImportError:
-    AMADEUS_SDK_AVAILABLE = False
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smiles-worker")
 
@@ -42,23 +36,6 @@ WORKER_KEY = os.environ.get("WORKER_SECRET", "change-me")
 PORT       = int(os.environ.get("PORT", "8080"))
 
 SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
-
-# Amadeus Self-Service API
-AMADEUS_ID       = os.environ.get("AMADEUS_CLIENT_ID", "")
-AMADEUS_SECRET   = os.environ.get("AMADEUS_CLIENT_SECRET", "")
-AMADEUS_HOSTNAME = os.environ.get("AMADEUS_HOSTNAME", "test")  # "test" o "production"
-
-amadeus_client = None
-if AMADEUS_SDK_AVAILABLE and AMADEUS_ID and AMADEUS_SECRET:
-    try:
-        amadeus_client = AmadeusClient(
-            client_id=AMADEUS_ID,
-            client_secret=AMADEUS_SECRET,
-            hostname=AMADEUS_HOSTNAME,
-        )
-    except Exception as e:
-        logging.warning(f"Amadeus init falló: {e}")
-        amadeus_client = None
 
 if SESSION_STRING:
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -744,121 +721,6 @@ async def run_direct_search(job_id: str, origin: str, dest: str, year_month: str
 
 
 # ═══════════════════════════════════════════════
-# Amadeus Self-Service (motor alternativo estable)
-# ═══════════════════════════════════════════════
-def _amadeus_parse_offer(offer: dict) -> dict:
-    """Transforma una offer de Amadeus al schema simple que usa el frontend."""
-    try:
-        price = float(offer["price"]["total"])
-    except (KeyError, ValueError, TypeError):
-        return None
-    currency = offer.get("price", {}).get("currency", "USD")
-
-    itineraries = []
-    for itin in offer.get("itineraries", []):
-        segs = itin.get("segments", []) or []
-        if not segs:
-            continue
-        first, last = segs[0], segs[-1]
-        itineraries.append({
-            "origin":   first.get("departure", {}).get("iataCode", ""),
-            "dest":     last.get("arrival", {}).get("iataCode", ""),
-            "dep_time": first.get("departure", {}).get("at", ""),
-            "arr_time": last.get("arrival", {}).get("at", ""),
-            "duration": itin.get("duration", ""),
-            "stops":    max(0, len(segs) - 1),
-            "segments": [{
-                "from":    s.get("departure", {}).get("iataCode", ""),
-                "to":      s.get("arrival", {}).get("iataCode", ""),
-                "dep":     s.get("departure", {}).get("at", ""),
-                "arr":     s.get("arrival", {}).get("at", ""),
-                "carrier": s.get("carrierCode", ""),
-                "number":  s.get("number", ""),
-                "duration": s.get("duration", ""),
-            } for s in segs],
-        })
-
-    airline_codes = offer.get("validatingAirlineCodes", []) or []
-    return {
-        "price": price,
-        "currency": currency,
-        "airlines": airline_codes,
-        "itineraries": itineraries,
-        "bookable_seats": offer.get("numberOfBookableSeats"),
-        "last_ticket_date": offer.get("lastTicketingDate"),
-    }
-
-
-def _amadeus_search_sync(origin, dest, date, return_date=None, adults=1,
-                          non_stop=False, max_offers=8, via=None):
-    """
-    Búsqueda sync (corre en executor).
-    `via`: hub IATA opcional. Si está, forza multi-city origin→via→dest (ida) y
-    espejo en vuelta si hay return_date.
-    """
-    if not amadeus_client:
-        return {"error": "Amadeus no configurado", "offers": []}
-
-    try:
-        if via:
-            # Multi-city: cada tramo como origin_destinations
-            origin_dests = [
-                {"id": "1", "originLocationCode": origin, "destinationLocationCode": via,
-                 "departureDateTimeRange": {"date": date}},
-                {"id": "2", "originLocationCode": via, "destinationLocationCode": dest,
-                 "departureDateTimeRange": {"date": date}},
-            ]
-            if return_date:
-                origin_dests += [
-                    {"id": "3", "originLocationCode": dest, "destinationLocationCode": via,
-                     "departureDateTimeRange": {"date": return_date}},
-                    {"id": "4", "originLocationCode": via, "destinationLocationCode": origin,
-                     "departureDateTimeRange": {"date": return_date}},
-                ]
-            body = {
-                "currencyCode": "USD",
-                "originDestinations": origin_dests,
-                "travelers": [{"id": str(i+1), "travelerType": "ADULT"} for i in range(adults)],
-                "sources": ["GDS"],
-                "searchCriteria": {"maxFlightOffers": max_offers},
-            }
-            resp = amadeus_client.shopping.flight_offers_search.post(body)
-        else:
-            params = {
-                "originLocationCode": origin,
-                "destinationLocationCode": dest,
-                "departureDate": date,
-                "adults": adults,
-                "currencyCode": "USD",
-                "max": max_offers,
-            }
-            if return_date:
-                params["returnDate"] = return_date
-            if non_stop:
-                params["nonStop"] = "true"
-            resp = amadeus_client.shopping.flight_offers_search.get(**params)
-
-        raw = resp.data or []
-        parsed = [p for p in (_amadeus_parse_offer(o) for o in raw) if p]
-        parsed.sort(key=lambda x: x["price"])
-        return {"offers": parsed, "count": len(parsed)}
-    except AmadeusResponseError as e:
-        return {"error": f"Amadeus error: {e}", "offers": []}
-    except Exception as e:
-        log.exception("Amadeus unexpected")
-        return {"error": str(e), "offers": []}
-
-
-async def amadeus_search(origin, dest, date, return_date=None, adults=1,
-                          non_stop=False, max_offers=8, via=None):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, _amadeus_search_sync,
-        origin, dest, date, return_date, adults, non_stop, max_offers, via,
-    )
-
-
-# ═══════════════════════════════════════════════
 # HTTP endpoints
 # ═══════════════════════════════════════════════
 def _auth(request):
@@ -952,49 +814,10 @@ async def handle_job_status(request: web.Request):
     })
 
 
-async def handle_amadeus_search(request: web.Request):
-    if not _auth(request):
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    if not amadeus_client:
-        return web.json_response(
-            {"error": "Amadeus no configurado (faltan AMADEUS_CLIENT_ID/SECRET)"},
-            status=503,
-        )
-    origin      = request.query.get("origin", "").upper()
-    dest        = request.query.get("dest", "").upper()
-    date        = request.query.get("date", "")
-    return_date = request.query.get("return_date", "") or None
-    via         = (request.query.get("via", "") or "").upper() or None
-    adults      = int(request.query.get("adults", "1"))
-    non_stop    = request.query.get("non_stop", "false").lower() == "true"
-    max_offers  = int(request.query.get("max", "8"))
-
-    if not (origin and dest and date):
-        return web.json_response({"error": "origin, dest, date requeridos"}, status=400)
-
-    try:
-        res = await amadeus_search(
-            origin, dest, date, return_date=return_date,
-            adults=adults, non_stop=non_stop, max_offers=max_offers, via=via,
-        )
-        return web.json_response({
-            "origin": origin, "dest": dest, "date": date,
-            "return_date": return_date, "via": via,
-            "hostname": AMADEUS_HOSTNAME,
-            **res,
-            "at": datetime.now().isoformat(),
-        })
-    except Exception as e:
-        log.exception("amadeus endpoint")
-        return web.json_response({"error": str(e)}, status=500)
-
-
 async def handle_health(request: web.Request):
     return web.json_response({
         "status": "ok", "connected": client.is_connected(),
         "fast_flights": FAST_FLIGHTS_AVAILABLE,
-        "amadeus": bool(amadeus_client),
-        "amadeus_hostname": AMADEUS_HOSTNAME if amadeus_client else None,
         "hubs": len(HUB_CODES),
         "concurrent_gf": MAX_CONCURRENT_GF,
         "jobs": len(JOBS),
@@ -1036,7 +859,6 @@ async def main():
     app.router.add_get("/direct/start",  handle_direct_start)
     app.router.add_get("/combo/start",   handle_combo_start)
     app.router.add_get("/combo/status",  handle_job_status)
-    app.router.add_get("/amadeus/search", handle_amadeus_search)
 
     runner = web.AppRunner(app)
     await runner.setup()
